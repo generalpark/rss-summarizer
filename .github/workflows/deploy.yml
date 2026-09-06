@@ -1,0 +1,82 @@
+name: Deploy to Raspberry Pi
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, robopi]
+    timeout-minutes: 25
+    env:
+      # 기존에 돌던 컨테이너·볼륨을 그대로 이어받기 위해 프로젝트명을 고정
+      COMPOSE_PROJECT_NAME: rss-summarizer
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 문법 검사
+        run: |
+          python3 -m compileall -q app/*.py
+          python3 -c "import yaml,sys; yaml.safe_load(open('app/feeds.yml')); yaml.safe_load(open('docker-compose.yml'))"
+
+      - name: 배포 준비 (.env 유지, 이전 이미지 기록)
+        id: prep
+        run: |
+          set -e
+          cp -f /home/aptx4/rss-summarizer/.env .env
+          PREV=$(docker inspect --format '{{.Image}}' rss-summarizer-app-1 2>/dev/null || echo "none")
+          echo "prev_image=$PREV" >> "$GITHUB_OUTPUT"
+          echo "이전 이미지: $PREV"
+
+      - name: 빌드 및 교체
+        run: |
+          set -e
+          docker compose up -d --build
+
+      - name: 헬스체크
+        id: health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health > /dev/null; then
+              echo "헬스체크 통과 (${i}회 시도)"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "헬스체크 실패"
+          exit 1
+
+      - name: 실패 시 롤백
+        if: failure() && steps.prep.outputs.prev_image != 'none'
+        run: |
+          echo "이전 이미지로 롤백: ${{ steps.prep.outputs.prev_image }}"
+          # compose가 쓰는 이미지 태그에 이전 이미지를 덮어씌우고 재빌드 없이 기동
+          docker tag ${{ steps.prep.outputs.prev_image }} rss-summarizer-app:latest
+          docker compose up -d --no-build --force-recreate app
+          sleep 10
+          if curl -fsS http://localhost:8080/health > /dev/null; then
+            echo "롤백 후 정상"
+          else
+            echo "롤백 후에도 비정상 - 수동 확인 필요"
+          fi
+
+      - name: 결과 알림
+        if: always()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TG_TOKEN" ]; then echo "텔레그램 미설정, 알림 생략"; exit 0; fi
+          if [ "${{ job.status }}" = "success" ]; then MSG="✅ 배포 성공"; else MSG="❌ 배포 실패 (롤백 시도됨)"; fi
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT}" \
+            -d text="${MSG}
+커밋: $(git log -1 --pretty=%s)
+$(git log -1 --pretty=%h) by ${{ github.actor }}" > /dev/null

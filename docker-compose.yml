@@ -16,6 +16,7 @@ services:
 
   app:
     build: ./app
+    image: rss-summarizer-app:latest   # 롤백 시 이전 이미지를 이 태그로 덮어쓴다
     restart: unless-stopped
     depends_on:
       db:
