@@ -1,0 +1,9 @@
+feeds:
+  - name: GeekNews
+    url: https://feeds.feedburner.com/geeknews-feed
+  - name: Hacker News
+    url: https://hnrss.org/frontpage
+  - name: 라즈베리파이 공식블로그
+    url: https://www.raspberrypi.com/blog/feed/
+  - name: Docker Blog
+    url: https://www.docker.com/blog/feed/
