@@ -3,7 +3,7 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import feedparser
 import httpx
@@ -141,7 +141,7 @@ def send_digest() -> int:
 
 def cleanup(days: int = 30) -> int:
     """오래된 데이터 정리 — 디스크가 차서 죽는 흔한 장애 예방."""
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
     with Session(engine) as s:
         rows = s.scalars(select(Article).where(Article.created_at < cutoff)).all()
         for a in rows:

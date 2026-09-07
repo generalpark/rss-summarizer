@@ -26,6 +26,11 @@ jobs:
           python3 -m compileall -q app/*.py
           python3 -c "import yaml,sys; yaml.safe_load(open('app/feeds.yml')); yaml.safe_load(open('docker-compose.yml'))"
 
+      - name: 테스트 (실패하면 배포하지 않음)
+        run: |
+          docker run --rm -v "$PWD/app:/app" -w /app python:3.12-slim \
+            sh -c "pip install -q -r requirements-dev.txt && python -m pytest tests -q"
+
       - name: 배포 준비 (.env 유지, 이전 이미지 기록)
         id: prep
         run: |
