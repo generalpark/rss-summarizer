@@ -115,3 +115,68 @@ def test_엔드포인트_응답(app_module, path):
     r = client.get(path)
     assert r.status_code == 200
     assert isinstance(r.json(), dict)
+
+
+# --- 조용한 실패 감지 (/health/digest) -------------------------------------
+# 배경: 텔레그램 발송이 3일간 400으로 실패했는데 /health 는 계속 200이었다.
+# 프로세스 생존과 기능 정상은 다르다.
+
+def test_다이제스트_한번도_안돌았으면_503(app_module):
+    client = TestClient(app_module.app)
+    r = client.get("/health/digest")
+    assert r.status_code == 503
+    assert r.json()["status"] == "unknown"
+
+
+def test_최근에_돌았으면_200(app_module):
+    with Session(app_module.engine) as s:
+        app_module.set_state(s, app_module.DIGEST_OK_KEY, app_module._utcnow())
+        s.commit()
+    client = TestClient(app_module.app)
+    r = client.get("/health/digest")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+
+
+def test_오래_안돌았으면_503(app_module):
+    stale = app_module._utcnow() - timedelta(hours=app_module.DIGEST_MAX_AGE_HOURS + 1)
+    with Session(app_module.engine) as s:
+        app_module.set_state(s, app_module.DIGEST_OK_KEY, stale)
+        s.commit()
+    client = TestClient(app_module.app)
+    r = client.get("/health/digest")
+    assert r.status_code == 503
+    assert r.json()["status"] == "stale"
+    assert r.json()["age_hours"] > app_module.DIGEST_MAX_AGE_HOURS
+
+
+def test_보낼게_없어도_정상수행으로_기록된다(app_module):
+    """뉴스가 없는 날에 거짓 경보가 울리면 안 된다."""
+    app_module.TELEGRAM_TOKEN = "x"
+    app_module.TELEGRAM_CHAT_ID = "y"
+    try:
+        assert app_module.send_digest() == 0
+        with Session(app_module.engine) as s:
+            assert app_module.get_state(s, app_module.DIGEST_OK_KEY) is not None
+    finally:
+        app_module.TELEGRAM_TOKEN = ""
+        app_module.TELEGRAM_CHAT_ID = ""
+
+
+def test_길이제한시_태그가_잘리지_않는다(app_module):
+    """<b> 태그 중간에서 자르면 텔레그램이 400을 낸다."""
+    import html as _html
+    rows = [type("A", (), {"title": f"제목{i}", "summary": "가" * 300,
+                           "link": f"https://e.com/{i}"})() for i in range(15)]
+    header = "📰 2026-01-01 요약"
+    parts, included, size = [], [], len(header) + 16
+    for a in rows:
+        block = f"<b>{_html.escape(a.title)}</b>\n{_html.escape(a.summary)}\n{a.link}\n"
+        if included and size + len(block) + 1 > app_module.TELEGRAM_LIMIT:
+            break
+        parts.append(block); included.append(a); size += len(block) + 1
+    text = "\n".join([f"{header} ({len(included)}건)\n", *parts])
+
+    assert len(text) <= app_module.TELEGRAM_LIMIT
+    assert text.count("<b>") == text.count("</b>")   # 태그 짝이 맞아야 한다
+    assert len(included) < len(rows)                 # 실제로 잘렸는지 확인

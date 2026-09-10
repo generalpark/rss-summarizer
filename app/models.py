@@ -23,3 +23,16 @@ class Article(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+
+class AppState(Base):
+    """운영 상태 저장용 key-value.
+
+    다이제스트가 마지막으로 정상 수행된 시각을 남긴다.
+    프로세스가 살아 있어도 기능이 죽는 '조용한 실패'를 감지하기 위한 것.
+    """
+
+    __tablename__ = "app_state"
+
+    key: Mapped[str] = mapped_column(String(50), primary_key=True)
+    value: Mapped[datetime] = mapped_column(DateTime)

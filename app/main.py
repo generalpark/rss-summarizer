@@ -9,12 +9,12 @@ import feedparser
 import httpx
 import yaml
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from models import Article, Base
+from models import AppState, Article, Base
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("summarizer")
@@ -28,6 +28,9 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "8"))
 COLLECT_INTERVAL_MIN = int(os.environ.get("COLLECT_INTERVAL_MIN", "60"))
+# 마지막 정상 다이제스트가 이 시간을 넘기면 /health/digest 가 503을 낸다.
+# 하루 1회 발송이므로 24시간 + 여유 1시간.
+DIGEST_MAX_AGE_HOURS = int(os.environ.get("DIGEST_MAX_AGE_HOURS", "25"))
 MAX_ATTEMPTS = 3
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -111,6 +114,24 @@ def summarize_pending(limit: int = 10) -> int:
 
 
 TELEGRAM_LIMIT = 4000
+DIGEST_OK_KEY = "last_digest_ok_at"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def get_state(session: Session, key: str) -> datetime | None:
+    row = session.get(AppState, key)
+    return row.value if row else None
+
+
+def set_state(session: Session, key: str, value: datetime) -> None:
+    row = session.get(AppState, key)
+    if row:
+        row.value = value
+    else:
+        session.add(AppState(key=key, value=value))
 
 
 def send_digest() -> int:
@@ -122,6 +143,10 @@ def send_digest() -> int:
             select(Article).where(Article.status == "summarized").order_by(Article.id).limit(15)
         ).all()
         if not rows:
+            # 보낼 게 없는 것은 정상 동작이다. 이때도 "돌았다"고 기록해야
+            # 뉴스가 없는 날에 헬스체크가 거짓 경보를 내지 않는다.
+            set_state(s, DIGEST_OK_KEY, _utcnow())
+            s.commit()
             return 0
 
         # 길이 제한을 글자 수로 자르면 <b> 태그 중간이 잘려 텔레그램이 400을 낸다.
@@ -159,6 +184,7 @@ def send_digest() -> int:
 
         for a in included:
             a.status = "sent"
+        set_state(s, DIGEST_OK_KEY, _utcnow())
         s.commit()
     log.info("digest sent: %d (queued %d)", len(included), len(rows))
     return len(included)
@@ -200,6 +226,31 @@ def health():
     with Session(engine) as s:
         s.execute(select(1))
     return {"status": "ok"}
+
+
+@app.get("/health/digest")
+def health_digest(response: Response):
+    """다이제스트가 제 시간에 돌고 있는지.
+
+    /health 는 '프로세스가 살아있나'만 답한다. 실제로 3일간 발송이 실패하는
+    동안에도 /health 는 계속 200이었다. 기능이 죽은 것을 감지하려면
+    '마지막으로 제대로 돈 시각'을 봐야 한다.
+    """
+    with Session(engine) as s:
+        last = get_state(s, DIGEST_OK_KEY)
+    if last is None:
+        response.status_code = 503
+        return {"status": "unknown", "detail": "아직 한 번도 정상 수행되지 않음"}
+    age_hours = (_utcnow() - last).total_seconds() / 3600
+    stale = age_hours > DIGEST_MAX_AGE_HOURS
+    if stale:
+        response.status_code = 503
+    return {
+        "status": "stale" if stale else "ok",
+        "last_digest_ok_at": last.isoformat(),
+        "age_hours": round(age_hours, 1),
+        "max_age_hours": DIGEST_MAX_AGE_HOURS,
+    }
 
 
 @app.get("/stats")
