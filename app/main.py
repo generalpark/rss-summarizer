@@ -18,6 +18,8 @@ from models import Article, Base
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("summarizer")
+# httpx는 요청 URL을 INFO로 남기는데, 텔레그램 URL에 봇 토큰이 들어 있어 로그(및 Loki)로 새어나간다.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 LLM_URL = os.environ.get("LLM_URL", "http://100.101.214.67:5001/v1/chat/completions")
@@ -108,6 +110,9 @@ def summarize_pending(limit: int = 10) -> int:
     return done
 
 
+TELEGRAM_LIMIT = 4000
+
+
 def send_digest() -> int:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.info("telegram not configured, skip digest")
@@ -118,25 +123,45 @@ def send_digest() -> int:
         ).all()
         if not rows:
             return 0
-        parts = [f"📰 {datetime.now():%Y-%m-%d} 요약 ({len(rows)}건)\n"]
+
+        # 길이 제한을 글자 수로 자르면 <b> 태그 중간이 잘려 텔레그램이 400을 낸다.
+        # 항목 단위로만 담고, 실제로 보낸 것만 sent 처리한다.
+        header = f"📰 {datetime.now():%Y-%m-%d} 요약"
+        parts, included = [], []
+        size = len(header) + 16  # 헤더 + 건수 표기 여유
         for a in rows:
-            parts.append(f"<b>{html.escape(a.title)}</b>\n{html.escape(a.summary or '')}\n{a.link}\n")
-        text = "\n".join(parts)[:4000]
+            block = f"<b>{html.escape(a.title)}</b>\n{html.escape(a.summary or '')}\n{a.link}\n"
+            if included and size + len(block) + 1 > TELEGRAM_LIMIT:
+                break
+            parts.append(block)
+            included.append(a)
+            size += len(block) + 1
+        if not included:
+            log.error("digest skipped: first item alone exceeds limit (id=%s)", rows[0].id)
+            return 0
+        text = "\n".join([f"{header} ({len(included)}건)\n", *parts])
+
         try:
-            httpx.post(
+            r = httpx.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
                       "parse_mode": "HTML", "disable_web_page_preview": True},
                 timeout=30,
-            ).raise_for_status()
+            )
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # 응답 본문에 실제 원인이 들어 있다. 토큰이 URL에 있으므로 본문만 남긴다.
+            log.error("telegram send failed: %s - %s", e.response.status_code, e.response.text[:300])
+            return 0
         except Exception as e:
             log.error("telegram send failed: %s", e)
             return 0
-        for a in rows:
+
+        for a in included:
             a.status = "sent"
         s.commit()
-    log.info("digest sent: %d", len(rows))
-    return len(rows)
+    log.info("digest sent: %d (queued %d)", len(included), len(rows))
+    return len(included)
 
 
 def cleanup(days: int = 30) -> int:
