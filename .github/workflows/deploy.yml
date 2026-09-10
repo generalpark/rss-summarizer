@@ -28,8 +28,15 @@ jobs:
 
       - name: 테스트 (실패하면 배포하지 않음)
         run: |
-          docker run --rm -v "$PWD/app:/app" -w /app python:3.12-slim \
-            sh -c "pip install -q -r requirements-dev.txt && python -m pytest tests -q"
+          # 컨테이너가 root로 돌면 바인드 마운트에 root 소유 캐시(.pytest_cache,
+          # __pycache__)가 남아 다음 체크아웃이 EACCES로 실패한다.
+          # 호스트 사용자로 실행하고 캐시 생성 자체를 막는다.
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -e HOME=/tmp \
+            -v "$PWD/app:/app" -w /app python:3.12-slim \
+            sh -c "pip install -q --no-cache-dir -r requirements-dev.txt && python -m pytest tests -q -p no:cacheprovider"
 
       - name: 배포 준비 (.env 유지, 이전 이미지 기록)
         id: prep
@@ -59,7 +66,9 @@ jobs:
           exit 1
 
       - name: 실패 시 롤백
-        if: failure() && steps.prep.outputs.prev_image != 'none'
+        # prep 이전 단계(체크아웃·문법검사·테스트)에서 실패하면 prev_image가 비어 있다.
+        # 빈 값으로 docker tag를 호출하면 롤백 스텝 자체가 에러를 낸다.
+        if: failure() && steps.prep.outputs.prev_image != '' && steps.prep.outputs.prev_image != 'none'
         run: |
           echo "이전 이미지로 롤백: ${{ steps.prep.outputs.prev_image }}"
           # compose가 쓰는 이미지 태그에 이전 이미지를 덮어씌우고 재빌드 없이 기동
@@ -77,12 +86,18 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JOB_STATUS: ${{ job.status }}
+          # git log에 의존하면 체크아웃 실패 시 이 스텝까지 같이 죽는다.
+          # 커밋 메시지는 env로 넘긴다(run: 안에 직접 넣으면 셸 인젝션 위험).
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          COMMIT_SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
         run: |
           if [ -z "$TG_TOKEN" ]; then echo "텔레그램 미설정, 알림 생략"; exit 0; fi
-          if [ "${{ job.status }}" = "success" ]; then MSG="✅ 배포 성공"; else MSG="❌ 배포 실패 (롤백 시도됨)"; fi
-          SUBJECT=$(git log -1 --pretty=%s)
-          SHA=$(git log -1 --pretty=%h)
-          TEXT=$(printf '%s\n커밋: %s\n%s by %s' "$MSG" "$SUBJECT" "$SHA" "${{ github.actor }}")
+          if [ "$JOB_STATUS" = "success" ]; then MSG="✅ 배포 성공"; else MSG="❌ 배포 실패"; fi
+          SUBJECT=$(printf '%s' "$COMMIT_MSG" | head -1)
+          SHA=$(printf '%s' "$COMMIT_SHA" | cut -c1-7)
+          TEXT=$(printf '%s\n커밋: %s\n%s by %s' "$MSG" "$SUBJECT" "$SHA" "$ACTOR")
           curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TG_CHAT}" \
             --data-urlencode "text=${TEXT}" > /dev/null
